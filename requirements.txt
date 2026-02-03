@@ -1,2 +1,6 @@
 uvicorn
 fastapi[standard]
+sqlalchemy[asyncio]
+asyncpg
+aiosqlite
+pydotenv
