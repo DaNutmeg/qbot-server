@@ -1,8 +1,30 @@
-from fastapi import FastAPI, Body, Cookie, WebSocket
+from contextlib import asynccontextmanager
+from fastapi import FastAPI, Body, Cookie, WebSocket, Depends, Response
 from pydantic import BaseModel
 from typing import List, Optional
 
-app = FastAPI(title="QTradingBot - Final Mock Implementation")
+import uuid
+from database import (
+    Accounts,
+    Stocks,
+    Trades,
+    Database,
+)
+from sqlalchemy.ext.asyncio import AsyncSession
+from sqlalchemy import select
+
+db = Database()
+
+@asynccontextmanager
+async def handle_lifespan(server: FastAPI):
+    global db
+    await db.init()
+    yield
+
+app = FastAPI(
+    lifespan=handle_lifespan,
+    title="QTradingBot - Final Mock Implementation"
+)
 
 # --- 1. DATA MODELS (The "Order Forms") ---
 
@@ -29,34 +51,55 @@ class TradeRequest(BaseModel):
 
 # Screenshot 1: GET Account Details
 @app.get("/api/account", response_model=AccountResponse)
-async def get_account(session_id: Optional[str] = Cookie(None)):
+async def get_account(
+    response: Response,
+    session_id: Optional[str] = Cookie(None),
+    asession: AsyncSession = Depends(db.session)
+):
     """Matches the 'This is called on application open' section."""
-    return {"balance": 0.0, "currency": "USD"}
+    account = await db.get_account_session(session_id, asession)
+    if not account:
+        session_id = str(uuid.uuid4())
+        asession.add(Accounts(id=uuid.UUID(session_id)))
+        account = await asession.get(Accounts, uuid.UUID(session_id))
+        response.set_cookie(key="session_id", value=str(account.id))
+    return {"balance": account.balance, "currency": account.currency}
 
-
+# Screenshot 1 & 5: POST Set Account Currency
 @app.post("/api/account/currency")
 async def set_account_currency(
     data: CurrencyUpdate,
-    session_id: str = Cookie(...)
+    session_id: str = Cookie(),
+    asession: AsyncSession = Depends(db.session)
 ):
-    """Captures {"currency": "NGN"} tied to a session ID."""
-    print(f"💰 [KITCHEN]: Session {session_id} updated currency to: {data.currency}")
-    return {"balance": 0.0, "currency": data.currency}
+    """
+    Captures the {"currency": "NGN"} example.
+    Check your terminal to see the capture!
+    """
+    account = await db.get_account_session(session_id, asession)
+    account.currency = data.currency
+    return {"balance": account.balance, "currency": account.currency}
 
 # Screenshot 2: GET List of Stocks
 @app.get("/api/trade/stocks", response_model=List[Stock])
-async def get_stocks(session_id: str = Cookie(None)):
+async def get_stocks(
+    session_id: Optional[str] = Cookie(None),
+    asession: AsyncSession = Depends(db.session)
+):
     """Returns the mock stock list (Google, Apple, etc.)"""
-    return [
-        {"id": 1, "name": "Google", "symbol": "GOOGL"},
-        {"id": 2, "name": "Apple", "symbol": "AAPL"}
-    ]
+    query = select(Stocks).order_by(Stocks.id).limit(5)
+    return [{
+        "id": stock.id,
+        "name": stock.name,
+        "symbol": stock.symbol
+    } for stock in (await asession.execute(query)).scalars()]
 
 # POST Start Trading
 @app.post("/api/trade")
 async def start_trading(
     trade_data: TradeRequest,
-    session_id: str = Cookie(...)
+    session_id: str = Cookie(),
+    asession: AsyncSession = Depends(db.session)
 ):
     """Executes trade for a specific session."""
     print(f"🚀 [TRADE]: Session {session_id} trading {trade_data.amount} {trade_data.currency}")
@@ -64,9 +107,15 @@ async def start_trading(
 
 # WebSocket Mocks (Returns 101 Switching Protocols)
 @app.get("/api/trade/history")
-async def trade_history_mock(session_id: str = Cookie(...)):
+async def trade_history_mock(
+    session_id: str = Cookie(),
+    asession: AsyncSession = Depends(db.session)
+):
     return {"message": f"WebSocket Ready - 101 Switching Protocols {session_id}"}
 
 @app.get("/api/trade/chart")
-async def trade_chart_mock(session_id: str = Cookie(...)):
+async def trade_chart_mock(
+    session_id: str = Cookie(),
+    asession: AsyncSession = Depends(db.session)
+):
     return {"message": f"Chart Data WebSocket Ready{session_id}"}
