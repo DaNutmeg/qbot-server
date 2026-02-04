@@ -1,5 +1,13 @@
 from contextlib import asynccontextmanager
-from fastapi import FastAPI, Body, Cookie, WebSocket, Depends, Response
+from fastapi import (
+    FastAPI,
+    Body,
+    Cookie,
+    WebSocket,
+    Depends,
+    Response
+)
+from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 from typing import List, Optional
 
@@ -15,6 +23,13 @@ from sqlalchemy import select
 
 db = Database()
 
+origins = [
+    "http://127.0.0.1",
+    "http://127.0.0.1:5173",
+    "http://localhost:5173",
+    "https://qbot.mooo.com",
+]
+
 @asynccontextmanager
 async def handle_lifespan(server: FastAPI):
     global db
@@ -24,6 +39,14 @@ async def handle_lifespan(server: FastAPI):
 app = FastAPI(
     lifespan=handle_lifespan,
     title="QTradingBot - Final Mock Implementation"
+)
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=origins,
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"]
 )
 
 # --- 1. DATA MODELS (The "Order Forms") ---
