@@ -85,7 +85,12 @@ async def get_account(
         session_id = str(uuid.uuid4())
         asession.add(Accounts(id=uuid.UUID(session_id)))
         account = await asession.get(Accounts, uuid.UUID(session_id))
-        response.set_cookie(key="session_id", value=str(account.id))
+        response.set_cookie(
+            key="session_id", 
+            value=str(account.id),
+            secure=True,
+            samesite="none"
+        )
     return {"balance": account.balance, "currency": account.currency}
 
 # Screenshot 1 & 5: POST Set Account Currency
