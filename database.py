@@ -31,7 +31,7 @@ class Accounts(Base):
     __tablename__ = "accounts"
 
     id: Mapped[uuid.UUID] = mapped_column(primary_key=True)
-    balance: Mapped[float] = mapped_column(Double, default=0.0)
+    balance: Mapped[float] = mapped_column(Double, default=50000.0)
     currency: Mapped[str] = mapped_column(String, default=ENUM_DOLLAR)
 
 class Stocks(Base):
