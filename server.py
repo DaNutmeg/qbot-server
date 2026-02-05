@@ -105,7 +105,14 @@ async def set_account_currency(
     Check your terminal to see the capture!
     """
     account = await db.get_account_session(session_id, asession)
-    account.currency = data.currency
+    if account.currency == "USD" and data.currency == "NGN":
+        account.balance *= 1500
+        account.currency = data.currency
+    elif account.currency == "NGN" and data.currency == "USD":
+        account.balance /= 1500
+        account.currency = data.currency
+    else:
+        account.currency = data.currency
     return {"balance": account.balance, "currency": account.currency}
 
 # Screenshot 2: GET List of Stocks
