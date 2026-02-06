@@ -1,3 +1,5 @@
+import uuid
+from asyncio import create_task, to_thread
 from contextlib import asynccontextmanager
 from fastapi import (
     FastAPI,
@@ -5,21 +7,31 @@ from fastapi import (
     Cookie,
     WebSocket,
     Depends,
-    Response
+    Response,
+    WebSocket,
+    HTTPException
 )
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 from typing import List, Optional
-
-import uuid
 from database import (
     Accounts,
+    Orders,
     Stocks,
     Trades,
     Database,
+    ENUM_PENDING,
+    ENUM_RUNNING
 )
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy import select
+from qbot import (
+    send_chart_data,
+    run_trade_worker,
+    run_qbot,
+    QLearningConfig
+)
+import valkey.asyncio as async_valkey
 
 db = Database()
 
@@ -27,13 +39,14 @@ origins = [
     "http://127.0.0.1",
     "http://127.0.0.1:5173",
     "http://localhost:5173",
-    "https://qbot.mooo.com",
+    "https://qbot.mooo.com"
 ]
 
 @asynccontextmanager
 async def handle_lifespan(server: FastAPI):
     global db
     await db.init()
+    create_task(run_trade_worker(db))
     yield
 
 app = FastAPI(
@@ -64,10 +77,10 @@ class Stock(BaseModel):
     symbol: str
 
 class TradeRequest(BaseModel):
-    currency: str
-    amount: int
-    stop_loss: int
-    take_profit: int
+    stock_symbol: str
+    amount: float
+    stop_loss: float
+    take_profit: float
     duration: str
 
 # --- 2. ENDPOINTS (The "Service Windows") ---
@@ -132,25 +145,89 @@ async def get_stocks(
 # POST Start Trading
 @app.post("/api/trade")
 async def start_trading(
-    trade_data: TradeRequest,
+    data: TradeRequest,
     session_id: str = Cookie(),
     asession: AsyncSession = Depends(db.session)
 ):
     """Executes trade for a specific session."""
-    print(f"🚀 [TRADE]: Session {session_id} trading {trade_data.amount} {trade_data.currency}")
-    return {"qbot_session_id": "f112dbac091441ad92ce9a8d0251aadf"}
+    account = await db.get_account_session(session_id, asession)
+    if account.currency == 'NGN':
+        data.amount *= 1500
+    if data.amount > account.balance:
+        raise HTTPException(status_code=400, detail="Amount is greater than balance")
+    account.balance -= data.amount
+    stock = await asession.execute(select(Stocks).where(Stocks.symbol == data.stock_symbol))
+    stock = stock.scalars().first()
+    if not stock:
+        raise HTTPException(status_code=400, detail="Invalid stock symbol")
+    asession.add(Orders(
+        account_id=account.id,
+        stock_id=stock.id,
+        stop_loss=data.stop_loss,
+        take_profit=data.take_profit,
+        amount=data.amount,
+        duration=data.duration,
+        status=ENUM_PENDING
+    ))
 
-# WebSocket Mocks (Returns 101 Switching Protocols)
-@app.get("/api/trade/history")
-async def trade_history_mock(
+    return {"balance": account.balance, "currency": account.currency}
+
+@app.websocket("/api/trade/chart")
+async def live_data_handler(
+    websocket: WebSocket,
     session_id: str = Cookie(),
     asession: AsyncSession = Depends(db.session)
 ):
-    return {"message": f"WebSocket Ready - 101 Switching Protocols {session_id}"}
+    consumer_session, producer_session = None, None
+    try:
+        await websocket.accept()
+        account = await db.get_account_session(session_id, asession)
+        if not account:
+            raise HTTPException(status_code=400, detail="Invalid account")
+        order = await asession.execute(
+            select(Orders)
+            .where(Accounts.id == account.id)
+            .where(Orders.status == ENUM_PENDING)
+        )
+        order = order.scalars().first()
+    
+        stock = await asession.execute(
+            select(Stocks).where(Stocks.id == order.stock_id)
+        )
+        stock = stock.scalars().first()
 
-@app.get("/api/trade/chart")
-async def trade_chart_mock(
-    session_id: str = Cookie(),
-    asession: AsyncSession = Depends(db.session)
-):
-    return {"message": f"Chart Data WebSocket Ready{session_id}"}
+        consumer_session = await db.valkey_session()
+        producer_session = await db.valkey_session()
+    
+        input_queue = f"QBOT:INPUT:{session_id}"
+        output_queue = f"QBOT:OUTPUT:{session_id}"
+
+        create_task(to_thread(
+            run_qbot,
+            session_id,
+            db.valkey_conn_str,
+            f"QBOT:INPUT:{session_id}",
+            f"QBOT:OUTPUT:{session_id}",
+            "QBOT:TRADE",
+            order.amount,
+            QLearningConfig()
+        ))
+    
+        create_task(send_chart_data(
+            stock.symbol, 
+            db.stocks_db, 
+            producer_session,
+            input_queue
+        ))
+    
+        print(f"live_data_handler - Running consumer loop")
+        while True:
+            _, data = await consumer_session.brpop([output_queue], timeout=600)
+            if data:
+                await websocket.send_text(data)
+    except Exception:
+        if consumer_session:
+            await consumer_session.aclose()
+        if producer_session:
+            await producer_session.aclose()
+
