@@ -121,9 +121,7 @@ def run_qbot(
         decode_responses=True
     )
     while True:
-        print("receiving data")
         _, data = valkey_session.brpop([input_queue], 0)
-        print(data)
         if data:
             valkey_session.lpush(output_queue, data)
 
@@ -270,7 +268,6 @@ async def send_chart_data(stock_symbol, stocks_db, valkey_session, input_queue):
     print(f"stock_symbol: {stock_symbol} input_queue: {input_queue}")
     async with stocks_db.execute(f"SELECT * FROM {stock_symbol}") as cursor:
         async for row in cursor:
-            print(row)
             await valkey_session.lpush(input_queue, json.dumps({
                 "type": "chart",
                 "time": datetime.strptime(row[0], "%Y-%m-%d").timestamp(),
