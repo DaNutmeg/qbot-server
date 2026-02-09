@@ -5,8 +5,11 @@ This is the `QTradingBot` backend built with `FastAPI`
 ## Files
 
 `server.py` - Contains the `FastAPI` server implementation
+
 `database.py` - Contains database related code (e.g syncing tables, queries)
+
 `workers.py` - Contains coroutines that would run as tasks
+
 `qbot.py` - Contains the actual implementation of the `Q-Learning algorithm`
 
 ## Running
