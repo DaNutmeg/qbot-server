@@ -1,21 +1,16 @@
 from __future__ import annotations
 
 import json
-import valkey.asyncio as async_valkey
+import uuid
 import valkey
-import enum
 import signal
+import math
 import threading
 from dataclasses import dataclass, field
-from asyncio import sleep
-from datetime import datetime
 from random import random, choice
 from typing import Dict, Hashable, List, Optional, Tuple
 
-class Action(str, enum.Enum):
-    HOLD = "hold"
-    BUY = "buy"
-    SELL = "sell"
+from database import OrderType, PositionStatus
 
 @dataclass
 class QLearningConfig:
@@ -23,12 +18,12 @@ class QLearningConfig:
     gamma: float = 0.95  # discount factor
     epsilon: float = 0.1  # exploration rate
     price_bin_size: float = 0.25  # percentage move bin for state discretisation
-    max_position: int = 1  # allow at most 1 open position
     stop_loss_pct: float = 0.01  # 1% stop loss
     take_profit_pct: float = 0.02  # 2% take profit
 
 @dataclass
 class Position:
+    id: str
     direction: int  # +1 for long, -1 for short
     entry_price: float
     stop_loss: float
@@ -45,7 +40,7 @@ class BotState:
 class QLearningAgent:
     def __init__(self, config = None):
         self.config = config or QLearningConfig()
-        self.q_table: Dict[Hashable, Dict[Action, float]] = {}
+        self.q_table: Dict[Hashable, Dict[OrderType, float]] = {}
 
     def _discretise_state(self, last_close: float, current_close: float, position: int):
         if last_close <= 0 or current_close <= 0:
@@ -63,12 +58,12 @@ class QLearningAgent:
 
     def _ensure_state(self, state: Hashable):
         if state not in self.q_table:
-            self.q_table[state] = {a: 0.0 for a in Action}
+            self.q_table[state] = {a: 0.0 for a in OrderType}
 
     def select_action(self, state: Hashable):
         self._ensure_state(state)
         if random() < self.config.epsilon:
-            return choice(list(Action))
+            return choice(list(OrderType))
         # greedy action
         action_values = self.q_table[state]
         return max(action_values, key=action_values.get)
@@ -76,7 +71,7 @@ class QLearningAgent:
     def update(
         self,
         state: Hashable,
-        action: Action,
+        action: OrderType,
         reward: float,
         next_state: Hashable = None,
     ):
@@ -99,33 +94,34 @@ def _compute_reward(
     new_equity: float,
     closed_position: Position = None,
 ):
-    # Reward is PnL delta; you can plug in more complex reward shaping here.
+    # Reward is PnL delta
     pnl = new_equity - prev_equity
-    # Optionally amplify reward on trade close to accelerate learning.
+
     if closed_position is not None:
         return pnl * 2.0
     return pnl
 
-def run_qbot(
-    session_id: str,
-    valkey_conn_str: str,
-    input_queue: str,
-    output_queue: str,
-    trade_queue: str,
-    initial_equity: float,
-    config: QLearningConfig = None
+def run_qbot_worker(
+    session_id,
+    order_id,
+    stock_id,
+    valkey_conn_str,
+    input_queue,
+    output_queue,
+    trade_queue,
+    initial_equity,
+    min_equity,
+    max_equity,
+    config = None,
+    stop_event = None
 ):
     valkey_session = valkey.Valkey.from_url(
         valkey_conn_str,
         socket_timeout=1800,
         decode_responses=True
     )
-    while True:
-        _, data = valkey_session.brpop([input_queue], 0)
-        if data:
-            valkey_session.lpush(output_queue, data)
 
-    """
+    active_equity = initial_equity
     agent = QLearningAgent(config)
     state = BotState(equity=initial_equity)
 
@@ -142,7 +138,7 @@ def run_qbot(
         pass
 
     while not stop_event.is_set():
-        result = client.blpop(input_queue, timeout=1)
+        result = valkey_session.brpop([input_queue], 1)
         if result is None:
             continue
 
@@ -150,13 +146,11 @@ def run_qbot(
         try:
             candle = json.loads(raw_item)
         except json.JSONDecodeError:
-            # If the producer pushes a dict directly (via str()), attempt eval fallback.
-            try:
-                candle = eval(raw_item)  # noqa: S307
-            except Exception:
-                continue
+            continue
 
-        # Expected candle keys: time, open, high, low, close
+        if candle.get("exit") is not None:
+            return
+
         close_price = float(candle.get("close", 0.0))
 
         with state.lock:
@@ -171,7 +165,8 @@ def run_qbot(
             if state.last_close is None:
                 state.last_close = close_price
                 # Not enough history yet; forward candle and continue.
-                client.rpush(output_queue, json.dumps(candle))
+                valkey_session.lpush(output_queue, json.dumps(candle))
+                valkey_session.ltrim(output_queue, 0, 99)
                 continue
 
             current_state = agent._discretise_state(
@@ -187,39 +182,47 @@ def run_qbot(
 
             # Apply action & risk rules.
             if state.position is None:
-                if action == Action.BUY:
+                if action == OrderType.BUY:
                     # Open long position.
                     entry = close_price
                     sl = entry * (1.0 - agent.config.stop_loss_pct)
                     tp = entry * (1.0 + agent.config.take_profit_pct)
-                    state.position = Position(direction=1, entry_price=entry, stop_loss=sl, take_profit=tp)
+                    state.position = Position(id=str(uuid.uuid4()), direction=1, entry_price=entry, stop_loss=sl, take_profit=tp)
                     # Emit trade signal.
-                    client.rpush(
-                        trade_queue,
-                        json.dumps(
-                            {
-                                "entry_price": entry,
-                                "stop_loss": sl,
-                                "take_profit": tp,
-                            }
-                        ),
-                    )
-                elif action == Action.SELL:
+                    valkey_session.lpush(trade_queue, json.dumps({
+                        "type": PositionStatus.OPEN,
+                        "output_queue": output_queue,
+                        "data": {
+                            "id": state.position.id,
+                            "account_id": session_id,
+                            "stock_id": stock_id,
+                            "order_id": order_id,
+                            "order_type": OrderType.BUY,
+                            "status": PositionStatus.OPEN,
+                            "price": entry
+                        }
+                    }))
+                    valkey_session.ltrim(trade_queue, 0, 99)
+                elif action == OrderType.SELL:
                     # Open short position (if your execution layer supports it).
                     entry = close_price
                     sl = entry * (1.0 + agent.config.stop_loss_pct)
                     tp = entry * (1.0 - agent.config.take_profit_pct)
-                    state.position = Position(direction=-1, entry_price=entry, stop_loss=sl, take_profit=tp)
-                    client.rpush(
-                        trade_queue,
-                        json.dumps(
-                            {
-                                "entry_price": entry,
-                                "stop_loss": sl,
-                                "take_profit": tp,
-                            }
-                        ),
-                    )
+                    state.position = Position(id=str(uuid.uuid4()), direction=-1, entry_price=entry, stop_loss=sl, take_profit=tp)
+                    valkey_session.lpush(trade_queue, json.dumps({
+                        "type": PositionStatus.OPEN,
+                        "output_queue": output_queue,
+                        "data": {
+                            "id": state.position.id,
+                            "account_id": session_id,
+                            "stock_id": stock_id,
+                            "order_id": order_id,
+                            "order_type": OrderType.SELL,
+                            "status": PositionStatus.OPEN,
+                            "price": entry
+                        }
+                    }))
+                    valkey_session.ltrim(trade_queue, 0, 99)
                 # HOLD means do nothing.
             else:
                 # Manage existing position based on price hitting SL/TP or explicit SELL/BUY opposite action.
@@ -230,11 +233,23 @@ def run_qbot(
                 hit_tp = (pos.direction == 1 and close_price >= pos.take_profit) or (
                     pos.direction == -1 and close_price <= pos.take_profit
                 )
-                close_on_signal = (pos.direction == 1 and action == Action.SELL) or (
-                    pos.direction == -1 and action == Action.BUY
+                close_on_signal = (pos.direction == 1 and action == OrderType.SELL) or (
+                    pos.direction == -1 and action == OrderType.BUY
                 )
 
                 if hit_sl or hit_tp or close_on_signal:
+                    position_pnl = (close_price - pos.entry_price) * pos.direction
+                    active_equity += position_pnl
+                    valkey_session.lpush(trade_queue, json.dumps({
+                        "type": PositionStatus.CLOSED,
+                        "output_queue": output_queue,
+                        "data": {
+                            "id": pos.id,
+                            "pnl": position_pnl,
+                            "equity": active_equity
+                        }
+                    }))
+                    valkey_session.ltrim(trade_queue, 0, 99)
                     closed_position = pos
                     state.position = None
 
@@ -243,7 +258,15 @@ def run_qbot(
                 dir_sign = state.position.direction
                 position_pnl = (close_price - state.position.entry_price) * dir_sign
                 state.equity = initial_equity + position_pnl
+                active_equity += position_pnl
             else:
+                hit_min_equity = active_equity <= min_equity
+                hit_max_equity = active_equity >= max_equity
+                if hit_min_equity or hit_max_equity:
+                    valkey_session.lpush(output_queue,
+                        json.dumps({"type": "stop"}))
+                    valkey_session.ltrim(output_queue, 0, 99)
+                    return
                 state.equity = state.equity  # unchanged if flat
 
             reward = _compute_reward(prev_equity, state.equity, closed_position)
@@ -260,32 +283,5 @@ def run_qbot(
             state.last_close = close_price
             state.step += 1
 
-        # Forward candle downstream (you can also attach debug info if desired).
-        client.rpush(output_queue, json.dumps(candle))
-    """
-
-async def send_chart_data(stock_symbol, stocks_db, valkey_session, input_queue):
-    print(f"stock_symbol: {stock_symbol} input_queue: {input_queue}")
-    async with stocks_db.execute(f"SELECT * FROM {stock_symbol}") as cursor:
-        async for row in cursor:
-            await valkey_session.lpush(input_queue, json.dumps({
-                "type": "chart",
-                "time": datetime.strptime(row[0], "%Y-%m-%d").timestamp(),
-                "open": round(float(row[1]), 6),
-                "high": round(float(row[2]), 6),
-                "low": round(float(row[3]), 6),
-                "close": round(float(row[4]), 6)
-            }))
-            await sleep(0.5)
-
-async def run_trade_worker(db):
-    valkey_session = await db.valkey_session()
-    try:
-        async for postgres_session in db.session():
-            print("run_trade_worker - Running trade worker")
-            while True:
-                data = await valkey_session.brpop("QBOT:TRADE", 0)
-                if data:
-                    await db.add_new_trade(json.loads(data), postgres_session)
-    except Exception:
-        await valkey_session.aclose()
+        valkey_session.lpush(output_queue, json.dumps(candle))
+        valkey_session.ltrim(output_queue, 0, 99)

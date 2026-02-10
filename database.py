@@ -1,33 +1,40 @@
 import uuid
-import enum
 import os
+from contextlib import asynccontextmanager
+from enum import Enum
 from dotenv import load_dotenv
 from datetime import datetime
-from sqlalchemy.ext.asyncio import (
-    create_async_engine,
-    async_sessionmaker,
-    AsyncSession
-)
-from sqlalchemy import Integer, Double, String, ForeignKey, select
-from sqlalchemy.orm import (
-    DeclarativeBase,
-    Mapped,
-    mapped_column
-)
+from sqlalchemy.ext.asyncio import create_async_engine, async_sessionmaker, AsyncSession
+from sqlalchemy import Integer, Double, String, ForeignKey, select, update, delete
+from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column
 import aiosqlite
 import valkey.asyncio as valkey
 
-ENUM_NAIRA = "NGN"
-ENUM_DOLLAR = "USD"
+load_dotenv()
 
-ENUM_SELL = "SELL"
-ENUM_BUY = "BUY"
+DB_USER = os.getenv("DB_USER", "qbot")
+DB_PASSWORD = os.getenv("DB_PASSWORD")
+DB_HOST = os.getenv("DB_HOST", "localhost")
+DB_NAME = os.getenv("DB_NAME", "qbot")
 
-ENUM_OPEN = "OPEN"
-ENUM_CLOSED = "CLOSED"
+DB_CONN_STRING = f"postgresql+asyncpg://{DB_USER}:{DB_PASSWORD}@{DB_HOST}/{DB_NAME}"
+VALKEY_CONN_STRING = os.getenv("VALKEY_CONN_STRING")
 
-ENUM_PENDING = "PENDING"
-ENUM_RUNNING = "RUNNING"
+class Currency(str, Enum):
+    NAIRA = "NGN"
+    DOLLAR = "USD"
+
+class OrderType(str, Enum):
+    BUY = "BUY"
+    SELL = "SELL"
+
+class PositionStatus(str, Enum):
+    OPEN = "OPEN"
+    CLOSED = "CLOSED"
+
+class Status(str, Enum):
+    PENDING = "PENDING"
+    RUNNING = "RUNNING"
 
 class Base(DeclarativeBase):
     pass
@@ -37,7 +44,7 @@ class Accounts(Base):
 
     id: Mapped[uuid.UUID] = mapped_column(primary_key=True)
     balance: Mapped[float] = mapped_column(Double, default=50000.0)
-    currency: Mapped[str] = mapped_column(String, default=ENUM_DOLLAR)
+    currency: Mapped[Currency] = mapped_column(String, default=Currency.DOLLAR)
 
 class Stocks(Base):
     __tablename__ = "stocks"
@@ -52,43 +59,22 @@ class Trades(Base):
     id: Mapped[uuid.UUID] = mapped_column(primary_key=True)
     account_id: Mapped[uuid.UUID] = mapped_column(ForeignKey("accounts.id"))
     stock_id: Mapped[int] = mapped_column(ForeignKey("stocks.id"))
-    order_type: Mapped[str] = mapped_column(nullable=False)
-    status: Mapped[str] = mapped_column(nullable=False)
+    order_id: Mapped[uuid.UUID] = mapped_column(nullable=False)
+    order_type: Mapped[OrderType] = mapped_column(nullable=False)
+    status: Mapped[PositionStatus] = mapped_column(nullable=False)
     amount: Mapped[float] = mapped_column(default=1.0)
     price: Mapped[float] = mapped_column(default=0.0)
     pnl: Mapped[float] = mapped_column(default=0.0)
     created_at: Mapped[datetime] = mapped_column(default=datetime.utcnow)
-    updated_at: Mapped[datetime] = mapped_column(default=datetime.utcnow, onupdate=datetime.utcnow)
-
-class Orders(Base):
-    __tablename__ = "orders"
-
-    id: Mapped[int] = mapped_column(Integer, primary_key=True)
-    account_id: Mapped[uuid.UUID] = mapped_column(ForeignKey("accounts.id"))
-    stock_id: Mapped[int] = mapped_column(ForeignKey("stocks.id"))
-    stop_loss: Mapped[float] = mapped_column(default=200.0)
-    take_profit: Mapped[float] = mapped_column(default=800.0)
-    amount: Mapped[float] = mapped_column(default=0.0)
-    duration: Mapped[str] = mapped_column(default="15m")
-    status: Mapped[str] = mapped_column(nullable=False)
-
-load_dotenv()
-
-DB_USER = os.getenv("DB_USER", "qbot")
-DB_PASSWORD = os.getenv("DB_PASSWORD")
-DB_HOST = os.getenv("DB_HOST", "localhost")
-DB_NAME = os.getenv("DB_NAME", "qbot")
-
-DB_CONN_STRING = f"postgresql+asyncpg://{DB_USER}:{DB_PASSWORD}@{DB_HOST}/{DB_NAME}"
-VALKEY_DB_CONN_STRING = f"valkey://{os.getenv("VALKEY_HOST")}"
-VALKEY_DB_CONN_STRING = f"{os.getenv("VALKEY_HOST")}"
+    updated_at: Mapped[datetime] = mapped_column(
+        default=datetime.utcnow, onupdate=datetime.utcnow)
 
 class Database():
 
     def __init__(self):
         self.db_engine = None
         self.stocks_db = None
-        self.valkey_conn_str = VALKEY_DB_CONN_STRING
+        self.valkey_conn_str = VALKEY_CONN_STRING
 
     async def init(self):
        self.db_engine = create_async_engine(DB_CONN_STRING)
@@ -102,23 +88,90 @@ class Database():
             async with asession.begin():
                 yield asession
 
+    @asynccontextmanager
+    async def raw_session(self):
+        async_session = async_sessionmaker(self.db_engine, expire_on_commit=False)
+        async with async_session() as asession:
+            yield asession
+
+    @asynccontextmanager
     async def valkey_session(self):
-        return valkey.Valkey.from_url(self.valkey_conn_str, socket_timeout=1800, decode_responses=True)
+        async_session = valkey.Valkey.from_url(
+            self.valkey_conn_str,
+            decode_responses=True,
+            socket_timeout=1800
+        )
+        try:
+            yield async_session
+        finally:
+            await async_session.close()
 
     async def close(self):
         await self.db_engine.dispose()
         await self.stocks_db.close()
 
-    async def get_account_session(self, session_id: str | None, asession: AsyncSession):
+    async def get_account_session(self, session_id, asession):
         account = None
         if session_id:
-            account = await asession.execute(select(Accounts).where(Accounts.id == uuid.UUID(session_id)))
+            account = await asession.execute(
+                select(Accounts)
+                .where(Accounts.id == uuid.UUID(session_id))
+            )
             account = account.scalars().first()
         return account
 
-    async def add_new_trade(self, data, session):
-        session.add(Trades(
-            id=uuid.uuid4(),
-            **data
-        ))
+    async def add_new_trade(self, data, asession):
+        async with asession.begin():
+            asession.add(Trades(**{
+                **data,
+                "id": uuid.UUID(data["id"]),
+                "account_id": uuid.UUID(data["account_id"]),
+                "order_id": uuid.UUID(data["order_id"])
+            }))
+            trade = await asession.get(Trades, uuid.UUID(data["id"]))
         print(f"add_new_trade - Added new trade {data}")
+        return {
+            "type": "trade",
+            "time": trade.created_at.timestamp(),
+            "order_type": trade.order_type,
+            "info": f"{trade.order_type} @ {round(trade.price, 2)}"
+        }
+
+    async def update_trade(self, data, type, asession):
+        async with asession.begin():
+            if type == PositionStatus.CLOSED:
+                await asession.execute(
+                    update(Trades)
+                    .values(
+                        status=PositionStatus.CLOSED,
+                        pnl=data["pnl"],
+                        amount=data["equity"]
+                    )
+                    .where(Trades.id == uuid.UUID(data["id"]))
+                )
+                trade = await asession.get(Trades, uuid.UUID(data["id"]))
+                return {
+                    "type": "trade_history",
+                    "time": trade.created_at.timestamp(),
+                    "order_type": trade.order_type,
+                    "amount": trade.amount,
+                    "price": trade.price,
+                    "pnl": trade.pnl
+                }
+        return None
+
+    async def get_trades(self, session_id, order_id, asession):
+        trades = await asession.execute(
+            select(Trades)
+            .where(Accounts.id == uuid.UUID(session_id))
+            .where(Trades.order_id == uuid.UUID(order_id))
+            .where(Trades.status == PositionStatus.CLOSED)
+        )
+        return trades.scalars()
+
+    async def delete_old_trades(self, session_id, asession):
+        await asession.execute(
+            delete(Trades)
+            .where(Trades.account_id == uuid.UUID(session_id))
+        )
+
