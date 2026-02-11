@@ -3,7 +3,7 @@ fastapi[standard]
 sqlalchemy[asyncio]
 asyncpg
 aiosqlite
-pydotenv
+python-dotenv
 websockets
 aiosqlite
 valkey[libvalkey]
