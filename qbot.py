@@ -142,6 +142,12 @@ def run_qbot_worker(
         if result is None:
             continue
 
+        if valkey_session.get(f"QBOT:ORDER:{session_id}") is None:
+            valkey_session.lpush(output_queue,
+                json.dumps({"type": "stop"}))
+            valkey_session.ltrim(output_queue, 0, 99)
+            return
+
         _, raw_item = result
         try:
             candle = json.loads(raw_item)
@@ -199,7 +205,9 @@ def run_qbot_worker(
                             "order_id": order_id,
                             "order_type": OrderType.BUY,
                             "status": PositionStatus.OPEN,
-                            "price": entry
+                            "price": entry,
+                            "amount": 1.0,
+                            "pnl": 0.0
                         }
                     }))
                     valkey_session.ltrim(trade_queue, 0, 99)
@@ -219,7 +227,9 @@ def run_qbot_worker(
                             "order_id": order_id,
                             "order_type": OrderType.SELL,
                             "status": PositionStatus.OPEN,
-                            "price": entry
+                            "price": entry,
+                            "amount": 1.0,
+                            "pnl": 0.0
                         }
                     }))
                     valkey_session.ltrim(trade_queue, 0, 99)

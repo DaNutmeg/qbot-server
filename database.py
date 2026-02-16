@@ -1,5 +1,6 @@
 import uuid
 import os
+import json
 from contextlib import asynccontextmanager
 from enum import Enum
 from dotenv import load_dotenv
@@ -45,6 +46,9 @@ class Accounts(Base):
     id: Mapped[uuid.UUID] = mapped_column(primary_key=True)
     balance: Mapped[float] = mapped_column(Double, default=50000.0)
     currency: Mapped[Currency] = mapped_column(String, default=Currency.DOLLAR)
+    created_at: Mapped[datetime] = mapped_column(default=datetime.utcnow)
+    updated_at: Mapped[datetime] = mapped_column(
+        default=datetime.utcnow, onupdate=datetime.utcnow)
 
 class Stocks(Base):
     __tablename__ = "stocks"
@@ -120,26 +124,41 @@ class Database():
             account = account.scalars().first()
         return account
 
-    async def add_new_trade(self, data, asession):
+    async def add_new_trade(self, data, asession, valkey_session):
+        """
         async with asession.begin():
-            asession.add(Trades(**{
+            values = {
                 **data,
                 "id": uuid.UUID(data["id"]),
                 "account_id": uuid.UUID(data["account_id"]),
                 "order_id": uuid.UUID(data["order_id"])
-            }))
+            }
+            asession.add(Trades(**values))
             trade = await asession.get(Trades, uuid.UUID(data["id"]))
-        print(f"add_new_trade - Added new trade {data}")
-        return {
-            "type": "trade",
-            "time": trade.created_at.timestamp(),
-            "order_type": trade.order_type,
-            "info": f"{trade.order_type} @ {round(trade.price, 2)}"
+        """
+        values = {
+            **data,
+            "created_at": datetime.utcnow().timestamp(),
+            "updated_at": datetime.utcnow().timestamp()
         }
 
-    async def update_trade(self, data, type, asession):
+        await valkey_session.set(
+            f"QBOT:TRADE:{data["id"]}",
+            json.dumps(values),
+            ex=60
+        )
+        #print(f"add_new_trade - Added new trade {values}")
+        return {
+            "type": "trade",
+            "time": values["created_at"],
+            "order_type": values["order_type"],
+            "info": f"{values["order_type"]} @ {round(values["price"], 2)}"
+        }
+
+    async def update_trade(self, data, type, asession, valkey_session):
         async with asession.begin():
             if type == PositionStatus.CLOSED:
+                """
                 await asession.execute(
                     update(Trades)
                     .values(
@@ -150,13 +169,23 @@ class Database():
                     .where(Trades.id == uuid.UUID(data["id"]))
                 )
                 trade = await asession.get(Trades, uuid.UUID(data["id"]))
+                """
+                trade = await valkey_session.get(f"QBOT:TRADE:{data["id"]}")
+                if trade is None:
+                    return None
+                await valkey_session.delete(f"QBOT:TRADE:{data["id"]}")
+
+                trade = json.loads(trade)
+                trade["pnl"] = data["pnl"]
+                trade["amount"] = data["equity"]
+
                 return {
                     "type": "trade_history",
-                    "time": trade.created_at.timestamp(),
-                    "order_type": trade.order_type,
-                    "amount": trade.amount,
-                    "price": trade.price,
-                    "pnl": trade.pnl
+                    "time": trade["created_at"],
+                    "order_type": trade["order_type"],
+                    "amount": trade["amount"],
+                    "price": trade["price"],
+                    "pnl": trade["pnl"]
                 }
         return None
 

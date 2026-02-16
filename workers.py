@@ -14,10 +14,10 @@ async def run_trade_worker(db):
                 data = json.loads(data[1])
 
                 if data["type"] == PositionStatus.OPEN:
-                    ret = await db.add_new_trade(data["data"], asession)
+                    ret = await db.add_new_trade(data["data"], asession, valkey_session)
                     continue
                 else:
-                    ret = await db.update_trade(data["data"], data["type"], asession)
+                    ret = await db.update_trade(data["data"], data["type"], asession, valkey_session)
 
                 if ret is not None:
                     await valkey_session.lpush(
@@ -42,6 +42,8 @@ async def run_chart_data_producer(db, stock_symbol, input_queue, order_key, char
         await valkey_session.delete(order_key)
 
 async def run_trade_history_producer(db, session_id, order_id, output_queue):
+    """Disabled"""
+    return
     print(f"run_trade_history_producer - session_id:{session_id} order_id:{order_id}")
     trades = None
     async with db.session() as asession:

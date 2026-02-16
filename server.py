@@ -25,7 +25,7 @@ from database import (
     Database
 )
 from sqlalchemy.ext.asyncio import AsyncSession
-from sqlalchemy import select
+from sqlalchemy import select, update, func
 
 from qbot import run_qbot_worker
 from workers import run_trade_worker, run_chart_data_producer, run_trade_history_producer
@@ -39,6 +39,9 @@ CHART_FREQUENCY = 1
 @asynccontextmanager
 async def handle_lifespan(server: FastAPI):
     await db.init()
+    async with db.valkey_session() as valkey_session:
+        async for key in valkey_session.scan_iter("QBOT:*"):
+            await valkey_session.delete(key)
     create_task(run_trade_worker(db))
     yield
 
@@ -88,9 +91,34 @@ async def get_account(
     """Matches the 'This is called on application open' section."""
     account = await db.get_account_session(session_id, asession)
     if not account:
+        total_accounts = await asession.execute(
+            select(func.count())
+            .select_from(Accounts)
+        )
+        total_accounts = total_accounts.scalar()
+
         session_id = str(uuid.uuid4())
-        asession.add(Accounts(id=uuid.UUID(session_id)))
+        if total_accounts >= 200: # Create no more than 200 accounts
+            account = await asession.execute(
+                select(Accounts)
+                .order_by(Accounts.updated_at)
+                .limit(1)
+            )
+            account = account.scalar()
+            await asession.execute(
+                update(Accounts)
+                .values(
+                    id=uuid.UUID(session_id),
+                    balance=Accounts.__table__.c.balance.default.arg,
+                    currency=Accounts.__table__.c.currency.default.arg
+                )
+                .where(Accounts.id == account.id)
+            )
+        else:
+            asession.add(Accounts(id=uuid.UUID(session_id)))
+            
         account = await asession.get(Accounts, uuid.UUID(session_id))
+
         response.set_cookie(
             key="session_id", 
             value=str(account.id),
@@ -231,7 +259,11 @@ async def live_data_handler(
         })
 
         if order["status"] == Status.PENDING:
-            tasks.append(create_task(to_thread(
+            await valkey_session.set(
+                f"QBOT:ORDER:{session_id}",
+                json.dumps({**order, "status": Status.RUNNING})
+            )
+            create_task(to_thread(
                 run_qbot_worker,
                 session_id,
                 order["order_id"],
@@ -243,32 +275,35 @@ async def live_data_handler(
                 order["amount"],
                 order["stop_loss"],
                 order["take_profit"],
-            )))
+            ))
     
-            tasks.append(create_task(run_chart_data_producer(
+            create_task(run_chart_data_producer(
                 db,
                 order["stock_symbol"], 
                 input_queue,
                 f"QBOT:ORDER:{session_id}",
                 CHART_FREQUENCY
-            )))
+            ))
         elif order["status"] == Status.RUNNING:
-            tasks.append(create_task(run_trade_history_producer(
+            create_task(run_trade_history_producer(
                 db,
                 session_id,
                 order["order_id"],
                 output_queue
-            )))
+            ))
     
         print(f"live_data_handler - Running consumer loop")
-        while True:
-            data = await valkey_session.brpop([output_queue], 5)
-            if data is not None:
-                _, data = data
-                if len(data) < 20:
-                    break
-                print(f"data:{data}")
-                await websocket.send_text(data)
+        try:
+            while True:
+                data = await valkey_session.brpop([output_queue], 5)
+                if data is not None:
+                    _, data = data
+                    if len(data) < 20:
+                        break
+                    print(f"data:{data}")
+                    await websocket.send_text(data)
+        except Exception:
+            return
     
         for task in tasks:
             task.cancel()
